@@ -72,7 +72,6 @@ conflict_cooldown = \(conflictCooldown)
 """
         do {
             try content.write(toFile: path, atomically: true, encoding: .utf8)
-            // Secure permissions: chmod 600
             try? FileManager.default.setAttributes([.posixPermissions: 0o600], ofItemAtPath: path)
             return true
         } catch {
@@ -120,7 +119,7 @@ class SettingsWindowController: NSObject, NSWindowDelegate {
             backing: .buffered,
             defer: false
         )
-        win.title = "pfSense Auto-Login - Settings & Credentials"
+        win.title = "Auto-Login Settings"
         win.delegate = self
         win.isReleasedWhenClosed = false
 
@@ -131,19 +130,18 @@ class SettingsWindowController: NSObject, NSWindowDelegate {
         var y: CGFloat = 370
 
         // Title
-        let titleLabel = NSTextField(labelWithString: "Wi-Fi & Captive Portal Configuration")
+        let titleLabel = NSTextField(labelWithString: "Captive Portal Configuration")
         titleLabel.font = NSFont.boldSystemFont(ofSize: 15)
         titleLabel.frame = NSRect(x: 24, y: y, width: 432, height: 22)
         contentView.addSubview(titleLabel)
 
         y -= 20
-        let subLabel = NSTextField(labelWithString: "Configure your login credentials and target network:")
+        let subLabel = NSTextField(labelWithString: "Enter credentials and network settings:")
         subLabel.textColor = .secondaryLabelColor
         subLabel.font = NSFont.systemFont(ofSize: 12)
         subLabel.frame = NSRect(x: 24, y: y, width: 432, height: 18)
         contentView.addSubview(subLabel)
 
-        // Helper to add label and input field
         func addFormRow(label: String, isSecure: Bool = false) -> NSTextField {
             y -= 48
             let lbl = NSTextField(labelWithString: label)
@@ -162,8 +160,8 @@ class SettingsWindowController: NSObject, NSWindowDelegate {
             }
         }
 
-        usernameField = addFormRow(label: "Portal Username / Student ID:")
-        passwordField = addFormRow(label: "Portal Password:", isSecure: true) as? NSSecureTextField
+        usernameField = addFormRow(label: "Username / Student ID:")
+        passwordField = addFormRow(label: "Password:", isSecure: true) as? NSSecureTextField
 
         // SSID Row with Detect Button
         y -= 48
@@ -182,8 +180,8 @@ class SettingsWindowController: NSObject, NSWindowDelegate {
         detectBtn.action = #selector(detectCurrentWifi)
         contentView.addSubview(detectBtn)
 
-        portalUrlField = addFormRow(label: "Captive Portal URL:")
-        cooldownField = addFormRow(label: "Phone Conflict Standby Cooldown (seconds):")
+        portalUrlField = addFormRow(label: "Portal Login URL:")
+        cooldownField = addFormRow(label: "Phone Conflict Cooldown (seconds):")
 
         // Status Feedback Label
         y -= 28
@@ -194,7 +192,7 @@ class SettingsWindowController: NSObject, NSWindowDelegate {
 
         // Buttons
         let saveButton = NSButton(frame: NSRect(x: 342, y: 16, width: 114, height: 32))
-        saveButton.title = "Save Settings"
+        saveButton.title = "Save"
         saveButton.bezelStyle = .rounded
         saveButton.keyEquivalent = "\r"
         saveButton.target = self
@@ -209,7 +207,7 @@ class SettingsWindowController: NSObject, NSWindowDelegate {
         contentView.addSubview(testButton)
 
         let cancelButton = NSButton(frame: NSRect(x: 100, y: 16, width: 114, height: 32))
-        cancelButton.title = "Close"
+        cancelButton.title = "Cancel"
         cancelButton.bezelStyle = .rounded
         cancelButton.target = self
         cancelButton.action = #selector(closeWindow)
@@ -232,11 +230,11 @@ class SettingsWindowController: NSObject, NSWindowDelegate {
         let state = appDelegate.readState()
         if let current = state.current_ssid, !current.isEmpty {
             ssidField.stringValue = current
-            statusLabel.textColor = .systemGreen
-            statusLabel.stringValue = "Detected active Wi-Fi: \(current)"
+            statusLabel.textColor = .labelColor
+            statusLabel.stringValue = "Detected active network: \(current)"
         } else {
             statusLabel.textColor = .systemOrange
-            statusLabel.stringValue = "Could not detect active SSID (check Wi-Fi connection)"
+            statusLabel.stringValue = "No active Wi-Fi detected"
         }
     }
 
@@ -250,27 +248,26 @@ class SettingsWindowController: NSObject, NSWindowDelegate {
 
         if config.username.isEmpty || config.password.isEmpty {
             statusLabel.textColor = .systemRed
-            statusLabel.stringValue = "Error: Username and Password cannot be empty."
+            statusLabel.stringValue = "Username and password cannot be empty."
             return
         }
 
         if config.save(to: configPath) {
             statusLabel.textColor = .systemGreen
-            statusLabel.stringValue = "✓ Credentials & settings saved securely (chmod 600)!"
-            // Re-trigger network check with new credentials
+            statusLabel.stringValue = "Settings saved successfully."
             if let appDelegate = NSApplication.shared.delegate as? AppDelegate {
                 appDelegate.runScriptAsync(args: ["--force", "--once"])
             }
         } else {
             statusLabel.textColor = .systemRed
-            statusLabel.stringValue = "Error: Failed to write config file."
+            statusLabel.stringValue = "Failed to save configuration."
         }
     }
 
     @objc func testLogin() {
         saveSettings()
-        statusLabel.textColor = .systemBlue
-        statusLabel.stringValue = "Submitting authentication test..."
+        statusLabel.textColor = .labelColor
+        statusLabel.stringValue = "Verifying authentication..."
         if let appDelegate = NSApplication.shared.delegate as? AppDelegate {
             appDelegate.runScriptAsync(args: ["--force", "--once"])
         }
@@ -335,7 +332,7 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         var state = readState()
         state.enabled = enabled
         state.status = enabled ? "INITIALIZING" : "DISABLED"
-        state.status_message = enabled ? "Enabled via Menu Bar" : "Disabled via Menu Bar"
+        state.status_message = enabled ? "Enabled" : "Disabled"
 
         let dir = (stateFilePath as NSString).deletingLastPathComponent
         try? FileManager.default.createDirectory(atPath: dir, withIntermediateDirectories: true, attributes: nil)
@@ -344,13 +341,13 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
             try? encoded.write(to: URL(fileURLWithPath: stateFilePath), options: .atomic)
         }
 
-        // Notify CLI worker & trigger in-flight cancellation if disabled
         let flag = enabled ? "--toggle-on" : "--toggle-off"
         runScriptAsync(args: [flag])
         refreshIconOnly()
     }
 
-    // MARK: - Icon Updating
+    // MARK: - Dedicated Captive Portal Icon (Key & Wireless Wave Symbol)
+    // Avoids conflict with macOS native Wi-Fi 3-arc fan icon
     func refreshIconOnly() {
         let state = readState()
         let isEnabled = state.enabled ?? true
@@ -361,74 +358,51 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     func updateIcon(status: String, enabled: Bool) {
         guard let button = statusItem.button else { return }
 
+        let config = NSImage.SymbolConfiguration(pointSize: 13, weight: .regular)
+
         if !enabled {
-            if #available(macOS 11.0, *) {
-                let config = NSImage.SymbolConfiguration(pointSize: 13, weight: .regular)
-                let image = NSImage(systemSymbolName: "wifi.slash", accessibilityDescription: "Disabled")?.withSymbolConfiguration(config)
-                image?.isTemplate = true
-                button.image = image
-            } else {
-                button.title = "⚪ pfSense"
-            }
-            button.toolTip = "pfSense Auto-Login: Disabled"
+            let image = NSImage(systemSymbolName: "key.slash", accessibilityDescription: "Auto-Login Disabled")?.withSymbolConfiguration(config)
+            image?.isTemplate = true
+            button.image = image
+            button.toolTip = "Auto-Login: Disabled"
             return
         }
 
         switch status {
         case "CONNECTED":
-            if #available(macOS 11.0, *) {
-                let config = NSImage.SymbolConfiguration(pointSize: 13, weight: .medium)
-                let image = NSImage(systemSymbolName: "wifi", accessibilityDescription: "Connected")?.withSymbolConfiguration(config)
-                image?.isTemplate = true
-                button.image = image
-            } else {
-                button.title = "🟢 pfSense"
-            }
-            button.toolTip = "pfSense: Internet Connected"
+            // Key emitting wireless radio waves: distinct authentication symbol
+            let image = NSImage(systemSymbolName: "key.radiowaves.forward", accessibilityDescription: "Auto-Login Connected")?.withSymbolConfiguration(config)
+            image?.isTemplate = true
+            button.image = image
+            button.toolTip = "Auto-Login: Connected"
 
         case "AUTHENTICATING":
-            if #available(macOS 11.0, *) {
-                let image = NSImage(systemSymbolName: "arrow.triangle.2.circlepath", accessibilityDescription: "Logging in")
-                image?.isTemplate = true
-                button.image = image
-            } else {
-                button.title = "🔵 pfSense"
-            }
-            button.toolTip = "pfSense: Authenticating..."
+            let image = NSImage(systemSymbolName: "arrow.triangle.2.circlepath", accessibilityDescription: "Authenticating")?.withSymbolConfiguration(config)
+            image?.isTemplate = true
+            button.image = image
+            button.toolTip = "Auto-Login: Authenticating..."
 
         case "CONFLICT_STANDBY", "STANDBY":
-            if #available(macOS 11.0, *) {
-                let image = NSImage(systemSymbolName: "person.2.slash", accessibilityDescription: "Session Conflict")
-                image?.isTemplate = true
-                button.image = image
-            } else {
-                button.title = "🟠 Standby"
-            }
-            button.toolTip = "pfSense: Standby (Phone Active)"
+            let image = NSImage(systemSymbolName: "pause.circle", accessibilityDescription: "Standby")?.withSymbolConfiguration(config)
+            image?.isTemplate = true
+            button.image = image
+            button.toolTip = "Auto-Login: Standby (Phone Active)"
 
         case "CAPTIVE":
-            if #available(macOS 11.0, *) {
-                let image = NSImage(systemSymbolName: "wifi.exclamationmark", accessibilityDescription: "Captive Portal")
-                image?.isTemplate = true
-                button.image = image
-            } else {
-                button.title = "🟡 Captive"
-            }
-            button.toolTip = "pfSense: Captive Portal Detected"
+            let image = NSImage(systemSymbolName: "exclamationmark.shield", accessibilityDescription: "Captive Portal")?.withSymbolConfiguration(config)
+            image?.isTemplate = true
+            button.image = image
+            button.toolTip = "Auto-Login: Captive Portal"
 
         default:
-            if #available(macOS 11.0, *) {
-                let image = NSImage(systemSymbolName: "wifi", accessibilityDescription: "Active")
-                image?.isTemplate = true
-                button.image = image
-            } else {
-                button.title = "pfSense"
-            }
-            button.toolTip = "pfSense Auto-Login"
+            let image = NSImage(systemSymbolName: "key.radiowaves.forward", accessibilityDescription: "Auto-Login Active")?.withSymbolConfiguration(config)
+            image?.isTemplate = true
+            button.image = image
+            button.toolTip = "Auto-Login: Active"
         }
     }
 
-    // MARK: - NSMenuDelegate (Rebuilds only on user click)
+    // MARK: - Clean, Native HIG Menu Construction (Zero Emojis, Native Checkmarks)
     func menuNeedsUpdate(_ menu: NSMenu) {
         menu.removeAllItems()
 
@@ -437,67 +411,82 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         let status = state.status ?? "INITIALIZING"
         let ssid = state.current_ssid ?? "Unknown"
 
-        // 1. Status Header
-        let statusTitle = "● Status: \(status)"
-        let statusItemMenu = NSMenuItem(title: statusTitle, action: nil, keyEquivalent: "")
+        // 1. Status Section
+        let statusDisplay = formatStatus(status)
+        let statusItemMenu = NSMenuItem(title: "Status: \(statusDisplay)", action: nil, keyEquivalent: "")
         statusItemMenu.isEnabled = false
         menu.addItem(statusItemMenu)
 
         if let msg = state.status_message, !msg.isEmpty {
-            let detailItem = NSMenuItem(title: "   \(msg)", action: nil, keyEquivalent: "")
+            let detailItem = NSMenuItem(title: msg, action: nil, keyEquivalent: "")
             detailItem.isEnabled = false
             menu.addItem(detailItem)
         }
 
-        let networkItem = NSMenuItem(title: "   Network: \(ssid)", action: nil, keyEquivalent: "")
+        let networkItem = NSMenuItem(title: "Network: \(ssid)", action: nil, keyEquivalent: "")
         networkItem.isEnabled = false
         menu.addItem(networkItem)
 
         menu.addItem(NSMenuItem.separator())
 
-        // 2. Main ON/OFF Toggle Item
-        let toggleTitle = isEnabled ? "✓ Auto-Login: Enabled (Turn OFF)" : "   Auto-Login: Disabled (Turn ON)"
-        let toggleItem = NSMenuItem(title: toggleTitle, action: #selector(toggleEnabled), keyEquivalent: "t")
+        // 2. Native Checkmark Toggle Item (Uses macOS native .on / .off state)
+        let toggleItem = NSMenuItem(title: "Enable Auto-Login", action: #selector(toggleEnabled), keyEquivalent: "")
         toggleItem.target = self
+        toggleItem.state = isEnabled ? .on : .off
         menu.addItem(toggleItem)
 
         menu.addItem(NSMenuItem.separator())
 
-        // 3. Graphical Credentials & Network Settings (NO BACKEND CODE NEEDED!)
-        let settingsItem = NSMenuItem(title: "⚙️ Settings & Credentials...", action: #selector(openSettingsWindow), keyEquivalent: "s")
+        // 3. Settings & Credentials Dialog
+        let settingsItem = NSMenuItem(title: "Settings...", action: #selector(openSettingsWindow), keyEquivalent: ",")
         settingsItem.target = self
         menu.addItem(settingsItem)
 
         menu.addItem(NSMenuItem.separator())
 
-        // 4. Session Controls
-        let forceItem = NSMenuItem(title: "⚡ Authenticate Now (Force)", action: #selector(forceLogin), keyEquivalent: "r")
+        // 4. Session Actions
+        let forceItem = NSMenuItem(title: "Authenticate Now", action: #selector(forceLogin), keyEquivalent: "r")
         forceItem.target = self
         menu.addItem(forceItem)
 
-        let logoutItem = NSMenuItem(title: "🚪 Release Session (Logout for Phone)", action: #selector(releaseSession), keyEquivalent: "l")
+        let logoutItem = NSMenuItem(title: "Release Session (Logout)", action: #selector(releaseSession), keyEquivalent: "l")
         logoutItem.target = self
         menu.addItem(logoutItem)
 
         if status == "CONFLICT_STANDBY" || status == "STANDBY" {
-            let takeoverItem = NSMenuItem(title: "📲 Take Over Session From Phone", action: #selector(takeoverSession), keyEquivalent: "k")
+            let takeoverItem = NSMenuItem(title: "Take Over Session", action: #selector(takeoverSession), keyEquivalent: "k")
             takeoverItem.target = self
             menu.addItem(takeoverItem)
         }
 
         menu.addItem(NSMenuItem.separator())
 
-        // 5. Utility Actions
-        let logItem = NSMenuItem(title: "📄 View Log File...", action: #selector(openLogFile), keyEquivalent: "")
+        // 5. Utility
+        let logItem = NSMenuItem(title: "View Log...", action: #selector(openLogFile), keyEquivalent: "")
         logItem.target = self
         menu.addItem(logItem)
 
         menu.addItem(NSMenuItem.separator())
 
         // 6. Quit
-        let quitItem = NSMenuItem(title: "Quit Menu Bar App", action: #selector(quitApp), keyEquivalent: "q")
+        let quitItem = NSMenuItem(title: "Quit Auto-Login", action: #selector(quitApp), keyEquivalent: "q")
         quitItem.target = self
         menu.addItem(quitItem)
+    }
+
+    func formatStatus(_ raw: String) -> String {
+        switch raw {
+        case "CONNECTED": return "Connected"
+        case "CAPTIVE": return "Captive Portal Detected"
+        case "AUTHENTICATING": return "Authenticating"
+        case "CONFLICT_STANDBY", "STANDBY": return "Standby (Phone Active)"
+        case "AUTH_FAILED": return "Authentication Failed"
+        case "QUOTA_EXHAUSTED", "QUOTA_EXCEEDED": return "Quota Reached"
+        case "DEGRADED", "DISCONNECTED": return "Disconnected"
+        case "DISABLED": return "Disabled"
+        case "UNKNOWN_NETWORK": return "Other Network"
+        default: return "Ready"
+        }
     }
 
     // MARK: - Actions
@@ -561,5 +550,5 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
 let app = NSApplication.shared
 let delegate = AppDelegate()
 app.delegate = delegate
-app.setActivationPolicy(.accessory) // Accessory prevents dock icon
+app.setActivationPolicy(.accessory)
 app.run()
