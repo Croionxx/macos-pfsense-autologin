@@ -13,6 +13,274 @@ struct AutoLoginState: Codable {
     var portal_url: String?
 }
 
+struct AppConfig {
+    var username: String = ""
+    var password: String = ""
+    var portalUrl: String = "http://172.20.28.1:8002/index.php?zone=hostelzone"
+    var connectivityCheckUrl: String = "http://clients3.google.com/generate_204"
+    var ssid: String = ""
+    var retryDelay: String = "5"
+    var conflictCooldown: String = "900"
+
+    static func load(from path: String) -> AppConfig {
+        var config = AppConfig()
+        guard let content = try? String(contentsOfFile: path, encoding: .utf8) else {
+            return config
+        }
+
+        var currentSection = ""
+        for line in content.components(separatedBy: .newlines) {
+            let trimmed = line.trimmingCharacters(in: .whitespaces)
+            if trimmed.isEmpty || trimmed.hasPrefix("#") || trimmed.hasPrefix(";") {
+                continue
+            }
+            if trimmed.hasPrefix("[") && trimmed.hasSuffix("]") {
+                currentSection = String(trimmed.dropFirst().dropLast()).lowercased()
+                continue
+            }
+            let parts = trimmed.split(separator: "=", maxSplits: 1).map { String($0).trimmingCharacters(in: .whitespaces) }
+            if parts.count == 2 {
+                let key = parts[0].lowercased()
+                let value = parts[1]
+                if currentSection == "credentials" {
+                    if key == "username" { config.username = value }
+                    else if key == "password" { config.password = value }
+                } else if currentSection == "settings" {
+                    if key == "portal_url" { config.portalUrl = value }
+                    else if key == "connectivity_check_url" { config.connectivityCheckUrl = value }
+                    else if key == "ssid" { config.ssid = value }
+                    else if key == "retry_delay" { config.retryDelay = value }
+                    else if key == "conflict_cooldown" { config.conflictCooldown = value }
+                }
+            }
+        }
+        return config
+    }
+
+    func save(to path: String) -> Bool {
+        let content = """
+[credentials]
+username = \(username)
+password = \(password)
+
+[settings]
+portal_url = \(portalUrl)
+connectivity_check_url = \(connectivityCheckUrl)
+ssid = \(ssid)
+retry_delay = \(retryDelay)
+conflict_cooldown = \(conflictCooldown)
+"""
+        do {
+            try content.write(toFile: path, atomically: true, encoding: .utf8)
+            // Secure permissions: chmod 600
+            try? FileManager.default.setAttributes([.posixPermissions: 0o600], ofItemAtPath: path)
+            return true
+        } catch {
+            return false
+        }
+    }
+}
+
+// MARK: - Settings Window Controller
+class SettingsWindowController: NSObject, NSWindowDelegate {
+    static let shared = SettingsWindowController()
+
+    var window: NSWindow?
+    var usernameField: NSTextField!
+    var passwordField: NSSecureTextField!
+    var ssidField: NSTextField!
+    var portalUrlField: NSTextField!
+    var cooldownField: NSTextField!
+    var statusLabel: NSTextField!
+
+    var configPath: String {
+        let appDelegate = NSApplication.shared.delegate as? AppDelegate
+        let dir = appDelegate?.scriptDirectory ?? "/Users/mac/Documents/autologin_script"
+        return "\(dir)/config.ini"
+    }
+
+    func showWindow() {
+        if window == nil {
+            createWindow()
+        }
+
+        loadConfigIntoFields()
+        statusLabel.stringValue = ""
+
+        guard let win = window else { return }
+        NSApp.activate(ignoringOtherApps: true)
+        win.center()
+        win.makeKeyAndOrderFront(nil)
+    }
+
+    func createWindow() {
+        let win = NSWindow(
+            contentRect: NSRect(x: 0, y: 0, width: 480, height: 420),
+            styleMask: [.titled, .closable, .miniaturizable],
+            backing: .buffered,
+            defer: false
+        )
+        win.title = "pfSense Auto-Login - Settings & Credentials"
+        win.delegate = self
+        win.isReleasedWhenClosed = false
+
+        let contentView = NSView(frame: win.contentView!.bounds)
+        contentView.autoresizingMask = [.width, .height]
+        win.contentView = contentView
+
+        var y: CGFloat = 370
+
+        // Title
+        let titleLabel = NSTextField(labelWithString: "Wi-Fi & Captive Portal Configuration")
+        titleLabel.font = NSFont.boldSystemFont(ofSize: 15)
+        titleLabel.frame = NSRect(x: 24, y: y, width: 432, height: 22)
+        contentView.addSubview(titleLabel)
+
+        y -= 20
+        let subLabel = NSTextField(labelWithString: "Configure your login credentials and target network:")
+        subLabel.textColor = .secondaryLabelColor
+        subLabel.font = NSFont.systemFont(ofSize: 12)
+        subLabel.frame = NSRect(x: 24, y: y, width: 432, height: 18)
+        contentView.addSubview(subLabel)
+
+        // Helper to add label and input field
+        func addFormRow(label: String, isSecure: Bool = false) -> NSTextField {
+            y -= 48
+            let lbl = NSTextField(labelWithString: label)
+            lbl.font = NSFont.systemFont(ofSize: 12, weight: .medium)
+            lbl.frame = NSRect(x: 24, y: y + 22, width: 432, height: 16)
+            contentView.addSubview(lbl)
+
+            if isSecure {
+                let secField = NSSecureTextField(frame: NSRect(x: 24, y: y, width: 432, height: 22))
+                contentView.addSubview(secField)
+                return secField
+            } else {
+                let field = NSTextField(frame: NSRect(x: 24, y: y, width: 432, height: 22))
+                contentView.addSubview(field)
+                return field
+            }
+        }
+
+        usernameField = addFormRow(label: "Portal Username / Student ID:")
+        passwordField = addFormRow(label: "Portal Password:", isSecure: true) as? NSSecureTextField
+
+        // SSID Row with Detect Button
+        y -= 48
+        let ssidLbl = NSTextField(labelWithString: "Target Wi-Fi SSID (leave blank for any network):")
+        ssidLbl.font = NSFont.systemFont(ofSize: 12, weight: .medium)
+        ssidLbl.frame = NSRect(x: 24, y: y + 22, width: 432, height: 16)
+        contentView.addSubview(ssidLbl)
+
+        ssidField = NSTextField(frame: NSRect(x: 24, y: y, width: 310, height: 22))
+        contentView.addSubview(ssidField)
+
+        let detectBtn = NSButton(frame: NSRect(x: 342, y: y - 1, width: 114, height: 24))
+        detectBtn.title = "Current Wi-Fi"
+        detectBtn.bezelStyle = .rounded
+        detectBtn.target = self
+        detectBtn.action = #selector(detectCurrentWifi)
+        contentView.addSubview(detectBtn)
+
+        portalUrlField = addFormRow(label: "Captive Portal URL:")
+        cooldownField = addFormRow(label: "Phone Conflict Standby Cooldown (seconds):")
+
+        // Status Feedback Label
+        y -= 28
+        statusLabel = NSTextField(labelWithString: "")
+        statusLabel.font = NSFont.systemFont(ofSize: 12, weight: .medium)
+        statusLabel.frame = NSRect(x: 24, y: y, width: 432, height: 18)
+        contentView.addSubview(statusLabel)
+
+        // Buttons
+        let saveButton = NSButton(frame: NSRect(x: 342, y: 16, width: 114, height: 32))
+        saveButton.title = "Save Settings"
+        saveButton.bezelStyle = .rounded
+        saveButton.keyEquivalent = "\r"
+        saveButton.target = self
+        saveButton.action = #selector(saveSettings)
+        contentView.addSubview(saveButton)
+
+        let testButton = NSButton(frame: NSRect(x: 220, y: 16, width: 114, height: 32))
+        testButton.title = "Test Login"
+        testButton.bezelStyle = .rounded
+        testButton.target = self
+        testButton.action = #selector(testLogin)
+        contentView.addSubview(testButton)
+
+        let cancelButton = NSButton(frame: NSRect(x: 100, y: 16, width: 114, height: 32))
+        cancelButton.title = "Close"
+        cancelButton.bezelStyle = .rounded
+        cancelButton.target = self
+        cancelButton.action = #selector(closeWindow)
+        contentView.addSubview(cancelButton)
+
+        self.window = win
+    }
+
+    func loadConfigIntoFields() {
+        let config = AppConfig.load(from: configPath)
+        usernameField.stringValue = config.username
+        passwordField.stringValue = config.password
+        ssidField.stringValue = config.ssid
+        portalUrlField.stringValue = config.portalUrl
+        cooldownField.stringValue = config.conflictCooldown
+    }
+
+    @objc func detectCurrentWifi() {
+        guard let appDelegate = NSApplication.shared.delegate as? AppDelegate else { return }
+        let state = appDelegate.readState()
+        if let current = state.current_ssid, !current.isEmpty {
+            ssidField.stringValue = current
+            statusLabel.textColor = .systemGreen
+            statusLabel.stringValue = "Detected active Wi-Fi: \(current)"
+        } else {
+            statusLabel.textColor = .systemOrange
+            statusLabel.stringValue = "Could not detect active SSID (check Wi-Fi connection)"
+        }
+    }
+
+    @objc func saveSettings() {
+        var config = AppConfig.load(from: configPath)
+        config.username = usernameField.stringValue.trimmingCharacters(in: .whitespaces)
+        config.password = passwordField.stringValue
+        config.ssid = ssidField.stringValue.trimmingCharacters(in: .whitespaces)
+        config.portalUrl = portalUrlField.stringValue.trimmingCharacters(in: .whitespaces)
+        config.conflictCooldown = cooldownField.stringValue.trimmingCharacters(in: .whitespaces)
+
+        if config.username.isEmpty || config.password.isEmpty {
+            statusLabel.textColor = .systemRed
+            statusLabel.stringValue = "Error: Username and Password cannot be empty."
+            return
+        }
+
+        if config.save(to: configPath) {
+            statusLabel.textColor = .systemGreen
+            statusLabel.stringValue = "✓ Credentials & settings saved securely (chmod 600)!"
+            // Re-trigger network check with new credentials
+            if let appDelegate = NSApplication.shared.delegate as? AppDelegate {
+                appDelegate.runScriptAsync(args: ["--force", "--once"])
+            }
+        } else {
+            statusLabel.textColor = .systemRed
+            statusLabel.stringValue = "Error: Failed to write config file."
+        }
+    }
+
+    @objc func testLogin() {
+        saveSettings()
+        statusLabel.textColor = .systemBlue
+        statusLabel.stringValue = "Submitting authentication test..."
+        if let appDelegate = NSApplication.shared.delegate as? AppDelegate {
+            appDelegate.runScriptAsync(args: ["--force", "--once"])
+        }
+    }
+
+    @objc func closeWindow() {
+        window?.close()
+    }
+}
+
 // MARK: - App Delegate
 class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     var statusItem: NSStatusItem!
@@ -49,8 +317,6 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
 
         refreshIconOnly()
 
-        // Timer to periodically poll state and update the menu bar icon
-        // Does NOT rebuild the menu while the user is actively viewing it
         timer = Timer.scheduledTimer(withTimeInterval: 2.5, repeats: true) { [weak self] _ in
             self?.refreshIconOnly()
         }
@@ -75,17 +341,16 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         try? FileManager.default.createDirectory(atPath: dir, withIntermediateDirectories: true, attributes: nil)
 
         if let encoded = try? JSONEncoder().encode(state) {
-            // Atomic file write to avoid partial reads
             try? encoded.write(to: URL(fileURLWithPath: stateFilePath), options: .atomic)
         }
 
-        // Notify CLI worker
+        // Notify CLI worker & trigger in-flight cancellation if disabled
         let flag = enabled ? "--toggle-on" : "--toggle-off"
         runScriptAsync(args: [flag])
         refreshIconOnly()
     }
 
-    // MARK: - Icon Updating (Lightweight, Non-Disruptive)
+    // MARK: - Icon Updating
     func refreshIconOnly() {
         let state = readState()
         let isEnabled = state.enabled ?? true
@@ -131,7 +396,7 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
             }
             button.toolTip = "pfSense: Authenticating..."
 
-        case "CONFLICT_STANDBY":
+        case "CONFLICT_STANDBY", "STANDBY":
             if #available(macOS 11.0, *) {
                 let image = NSImage(systemSymbolName: "person.2.slash", accessibilityDescription: "Session Conflict")
                 image?.isTemplate = true
@@ -191,14 +456,21 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         menu.addItem(NSMenuItem.separator())
 
         // 2. Main ON/OFF Toggle Item
-        let toggleTitle = isEnabled ? "✓ Auto-Login: Enabled" : "   Auto-Login: Disabled (Click to Enable)"
+        let toggleTitle = isEnabled ? "✓ Auto-Login: Enabled (Turn OFF)" : "   Auto-Login: Disabled (Turn ON)"
         let toggleItem = NSMenuItem(title: toggleTitle, action: #selector(toggleEnabled), keyEquivalent: "t")
         toggleItem.target = self
         menu.addItem(toggleItem)
 
         menu.addItem(NSMenuItem.separator())
 
-        // 3. Session Controls
+        // 3. Graphical Credentials & Network Settings (NO BACKEND CODE NEEDED!)
+        let settingsItem = NSMenuItem(title: "⚙️ Settings & Credentials...", action: #selector(openSettingsWindow), keyEquivalent: "s")
+        settingsItem.target = self
+        menu.addItem(settingsItem)
+
+        menu.addItem(NSMenuItem.separator())
+
+        // 4. Session Controls
         let forceItem = NSMenuItem(title: "⚡ Authenticate Now (Force)", action: #selector(forceLogin), keyEquivalent: "r")
         forceItem.target = self
         menu.addItem(forceItem)
@@ -207,7 +479,7 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         logoutItem.target = self
         menu.addItem(logoutItem)
 
-        if status == "CONFLICT_STANDBY" {
+        if status == "CONFLICT_STANDBY" || status == "STANDBY" {
             let takeoverItem = NSMenuItem(title: "📲 Take Over Session From Phone", action: #selector(takeoverSession), keyEquivalent: "k")
             takeoverItem.target = self
             menu.addItem(takeoverItem)
@@ -215,18 +487,14 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
 
         menu.addItem(NSMenuItem.separator())
 
-        // 4. Utility Actions
+        // 5. Utility Actions
         let logItem = NSMenuItem(title: "📄 View Log File...", action: #selector(openLogFile), keyEquivalent: "")
         logItem.target = self
         menu.addItem(logItem)
 
-        let configItem = NSMenuItem(title: "⚙️ Edit Config (config.ini)...", action: #selector(openConfigFile), keyEquivalent: "")
-        configItem.target = self
-        menu.addItem(configItem)
-
         menu.addItem(NSMenuItem.separator())
 
-        // 5. Quit
+        // 6. Quit
         let quitItem = NSMenuItem(title: "Quit Menu Bar App", action: #selector(quitApp), keyEquivalent: "q")
         quitItem.target = self
         menu.addItem(quitItem)
@@ -236,6 +504,10 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     @objc func toggleEnabled() {
         let current = readState().enabled ?? true
         writeEnabledState(enabled: !current)
+    }
+
+    @objc func openSettingsWindow() {
+        SettingsWindowController.shared.showWindow()
     }
 
     @objc func forceLogin() {
@@ -256,11 +528,6 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
             FileManager.default.createFile(atPath: logPath, contents: nil, attributes: nil)
         }
         NSWorkspace.shared.open(URL(fileURLWithPath: logPath))
-    }
-
-    @objc func openConfigFile() {
-        let cfgPath = "\(scriptDirectory)/config.ini"
-        NSWorkspace.shared.open(URL(fileURLWithPath: cfgPath))
     }
 
     @objc func quitApp() {
@@ -294,5 +561,5 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
 let app = NSApplication.shared
 let delegate = AppDelegate()
 app.delegate = delegate
-app.setActivationPolicy(.accessory) // Accessory prevents icon in Dock
+app.setActivationPolicy(.accessory) // Accessory prevents dock icon
 app.run()

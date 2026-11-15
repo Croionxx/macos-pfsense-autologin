@@ -24,12 +24,15 @@ A native macOS top bar status item (`AutoLoginMenuBar.app`) built with Swift and
   - 🟠 **Standby**: Session active on phone/another device; flapping prevented.
   - ⚪ **Disabled**: Auto-login turned off by user.
 * **Instant Toggle**: Click `✓ Auto-Login: Enabled` to turn auto-login ON or OFF with zero delay.
+* **Graphical Settings & Credentials Manager**:
+  - Click `⚙️ Settings & Credentials...` directly from the top menu bar to open a native preferences window.
+  - Enter and save your **Username**, **Password**, **Target Wi-Fi SSID** (with an automatic "Current Wi-Fi" detection button), **Portal URL**, and **Standby Cooldown** without ever opening a terminal, text editor, or editing backend code!
+  - Credentials are automatically saved with hardened file permissions (`chmod 600`).
 * **Quick Actions**:
   - `⚡ Authenticate Now (Force)`: Forces immediate authentication.
   - `🚪 Release Session (Logout)`: Drops the session on pfSense so your phone can use it.
   - `📲 Take Over Session From Phone`: Clears standby and claims the connection.
   - `📄 View Log File...`: Opens the live activity log.
-  - `⚙️ Edit Config...`: Opens `config.ini` in your default text editor.
 
 ### 3. 🔒 Single-Instance Process Mutex (`flock`)
 * Uses non-blocking OS file locks (`fcntl.flock`).
