@@ -111,7 +111,7 @@ class PortalFormParser(HTMLParser):
             name = attr_dict.get("name", "")
             value = attr_dict.get("value", "")
             if name and (input_type == "hidden" or self.in_form):
-                if input_type == "hidden":
+                if input_type == "hidden" and name.lower() not in ("logout_id", "logout"):
                     self.hidden_fields[name] = value
 
     def handle_endtag(self, tag):
@@ -361,7 +361,7 @@ class StateMachine:
         },
         Status.CONNECTED: {
             Status.CAPTIVE, Status.DEGRADED, Status.DISCONNECTED,
-            Status.DISABLED, Status.CONNECTED
+            Status.DISABLED, Status.CONNECTED, Status.AUTHENTICATING
         },
         Status.CAPTIVE: {
             Status.AUTHENTICATING, Status.DEGRADED, Status.DISCONNECTED,
@@ -590,6 +590,16 @@ class AutoLoginEngine:
         try:
             resp = self.session.get(self.portal_url, timeout=7, verify=False, allow_redirects=True)
             if resp.status_code == 200:
+                if "portal session is connected" in resp.text.lower():
+                    logging.info("Captive portal reports session is already connected.")
+                    self.state_mgr.clear_standby()
+                    self.state_mgr.reset_auth_failures()
+                    self.sm.transition_to(
+                        Status.CONNECTED,
+                        message="Portal session is connected"
+                    )
+                    return True
+
                 url = str(resp.url) if (hasattr(resp, "url") and isinstance(resp.url, str)) else self.portal_url
                 parser = PortalFormParser(base_url=url)
                 parser.feed(resp.text)
@@ -707,14 +717,32 @@ class AutoLoginEngine:
         Also enters Standby Mode so background automation does not
         immediately re-authenticate and kick the other device off.
         """
+        import re
         logging.info("Attempting to release (logout) captive portal session")
         parsed = urlparse(self.portal_url)
-        # pfSense standard logout endpoint
-        logout_url = f"{parsed.scheme}://{parsed.netloc}/index.php?zone={self._extract_zone()}&logout=true"
+        action_url = self.portal_url
+        payload = {"zone": self._extract_zone(), "logout": "Disconnect"}
+
         try:
-            r = self.session.get(logout_url, timeout=5, verify=False)
-            logging.info(f"Logout request sent to {logout_url} (HTTP {r.status_code})")
-            # Enter standby so background checks don't immediately re-authenticate
+            resp = self.session.get(self.portal_url, timeout=5, verify=False)
+            if resp.status_code == 200:
+                if "logout_id" in resp.text:
+                    m_id = re.search(r'name=["\']logout_id["\']\s+type=["\']hidden["\']\s+value=["\']([^"\']+)["\']', resp.text)
+                    if not m_id:
+                        m_id = re.search(r'value=["\']([^"\']+)["\']\s+name=["\']logout_id["\']', resp.text)
+                    if m_id:
+                        payload["logout_id"] = m_id.group(1)
+                    m_action = re.search(r'<form[^>]+action=["\']([^"\']+)["\']', resp.text)
+                    if m_action:
+                        action_url = urljoin(self.portal_url, m_action.group(1))
+
+            if "logout_id" in payload:
+                r = self.session.post(action_url, data=payload, timeout=5, verify=False, allow_redirects=False)
+            else:
+                logout_url = f"{parsed.scheme}://{parsed.netloc}/index.php?zone={self._extract_zone()}&logout=true"
+                r = self.session.get(logout_url, timeout=5, verify=False)
+
+            logging.info(f"Logout request sent (HTTP {r.status_code})")
             self.state_mgr.enter_standby(self.conflict_cooldown, reason="Session released for phone")
             self.sm.transition_to(
                 Status.DEGRADED,
