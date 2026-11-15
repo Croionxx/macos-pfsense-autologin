@@ -1,298 +1,190 @@
-# pfSense Captive Portal Auto-Login for macOS
+# pfSense Captive Portal Auto-Login with macOS Menu Bar Toggle
 
-This project provides a **safe, reliable, and macOS-native auto-login solution** for networks that use **pfSense / Netgate captive portals** (hostels, campuses, dorms, etc.).
+A reliable, native macOS auto-login solution and menu bar companion for networks protected by **pfSense / Netgate captive portals** (hostels, university dorms, colleges, campuses, and enterprise guest zones).
 
-It automatically re-authenticates you when the captive portal session expires, without browser automation or insecure hacks.
-
----
-
-## ✅ What This Solves
-
-* Captive portal logs you out randomly
-* Internet stops working until you re-login
-* macOS does not reliably notify when this happens
-* You want an automatic, safe fix
-
-This tool:
-
-* Detects loss of internet
-* Detects captive portal availability
-* Logs in automatically
-* Exits immediately when internet is already working
+It automatically authenticates when your captive session expires, handles **concurrent session limits** without fighting other devices (e.g., your smartphone), extracts **CSRF tokens and dynamic form actions**, and gives you a **top bar toggle button** in macOS to turn auto-login ON or OFF instantly.
 
 ---
 
-## ✨ Features
+## 🚀 Key Improvements & Features
 
-* macOS-native (`launchd`)
-* No root privileges
-* No browser automation
-* No credential leakage
-* Works around macOS Wi-Fi SSID reporting bugs
-* Safe retry logic with backoff
-* Event-driven + watchdog fallback
+### 1. 🛡️ Anti-Flapping Session Arbitration (Solving Phone vs. Mac Conflicts)
+Many campus and hostel networks enforce **strict single-session limits** (`Concurrent User Logins: Disabled`). When your smartphone connects, the captive portal drops your Mac. A naive script would immediately re-authenticate, kicking your phone off, causing your phone to re-login, creating an infinite **ping-pong disconnection storm** that gets your account or MAC blacklisted!
+* **Response Body Inspection**: Detects portal error messages (*"maximum session limit reached"*, *"already logged in from another IP"*, *"simultaneous use"*).
+* **Smart Standby Mode**: When another device is active, the engine enters a cooldown standby (default 15 minutes) instead of spamming login requests.
+* **Release Session (Logout)**: Supports explicit logout (`--logout` or via Menu Bar) so you can release the captive slot for your phone without having to disable your Wi-Fi!
+* **Take Over Session**: Allows you to override standby with one click whenever you need your Mac to take back the connection.
+
+### 2. 🎛️ macOS Menu Bar Toggle (Top Bar Button)
+A native macOS top bar status item (`AutoLoginMenuBar.app`) built with Swift and AppKit (`LSUIElement`):
+* **Live Status Icon**:
+  - 🟢 **Connected**: Internet access confirmed.
+  - 🟡 **Captive**: Behind captive portal, preparing login.
+  - 🔵 **Authenticating**: Login in progress.
+  - 🟠 **Standby**: Session active on phone/another device; flapping prevented.
+  - ⚪ **Disabled**: Auto-login turned off by user.
+* **Instant Toggle**: Click `✓ Auto-Login: Enabled` to turn auto-login ON or OFF with zero delay.
+* **Quick Actions**:
+  - `⚡ Authenticate Now (Force)`: Forces immediate authentication.
+  - `🚪 Release Session (Logout)`: Drops the session on pfSense so your phone can use it.
+  - `📲 Take Over Session From Phone`: Clears standby and claims the connection.
+  - `📄 View Log File...`: Opens the live activity log.
+  - `⚙️ Edit Config...`: Opens `config.ini` in your default text editor.
+
+### 3. 🔒 Single-Instance Process Mutex (`flock`)
+* Uses non-blocking OS file locks (`fcntl.flock`).
+* If `launchd` triggers while a previous check is running or if you manually trigger a check, duplicate instances cleanly exit, preventing socket exhaustion and credential spam.
+
+### 4. 🧩 Dynamic Form & CSRF Token Extraction
+* Modern pfSense setups enforce CSRF security tokens (`__csrf_magic` and zone nonces) or redirect to dynamic HTTPS ports (e.g. port `8003`).
+* Built-in HTML form parser automatically inspects the landing page, extracts hidden tokens and dynamic form actions, and submits them along with your credentials.
+
+### 5. ⚡ Modern macOS `launchd` Supervisor
+* Completely removed the deprecated `KeepAlive: NetworkState` directive that caused CPU-heavy 10-second respawn storms on modern macOS (Ventura, Sonoma, Sequoia).
+* Runs on a clean 60-second watchdog interval using modern `launchctl bootstrap` / `bootout` commands.
+* If disabled via the Menu Bar toggle, each background check exits in `< 5ms` with zero network overhead.
 
 ---
 
 ## 📁 Repository Structure
 
 ```
-wifi-autologin/
-├── portal_autologin.py        # Main script
-├── config.ini.example         # Template (no secrets)
-├── README.md                  # This file
+autologin_script/
+├── portal_autologin.py           # Core engine & session arbitration
+├── config.ini.example            # Configuration template (no secrets)
+├── config.ini                    # Local configuration (chmod 600, gitignored)
+├── com.pfsense.autologin.plist   # LaunchAgent service definition
+├── setup.sh                      # One-click installation & build script
+├── menubar/
+│   ├── main.swift                # Native Swift Menu Bar Top Bar app
+│   ├── build_menubar.sh          # Swift compilation & app packaging script
+│   └── AutoLoginMenuBar.app      # Standalone macOS Menu Bar application
+└── tests/
+    └── test_autologin.py         # Comprehensive unit test suite (>=85% coverage)
 ```
 
 ---
 
-## 🧠 How the Script Works (High Level)
+## 📦 Quick Installation
 
-1. **Triggered** by macOS network changes or periodic watchdog
-2. Checks real internet connectivity (Google `generate_204`)
-3. If internet is already up → exits immediately
-4. If internet is down:
-
-   * Checks captive portal availability
-   * Sends login POST request
-   * Verifies internet is restored
-5. Exits cleanly (`--once` mode)
-
-This ensures:
-
-* No background loops
-* No unnecessary requests
-* No credential spam
-
----
-
-## 🔍 Code Overview (`portal_autologin.py`)
-
-### Key Components
-
-| Function             | Purpose                          |
-| -------------------- | -------------------------------- |
-| `internet_up()`      | Detects real internet access     |
-| `portal_available()` | Confirms captive portal presence |
-| `login_pfsense()`    | Performs portal login            |
-| `current_ssid()`     | Best-effort SSID detection       |
-| `run(--once)`        | One-shot execution for stability |
-
-### Important Design Decisions
-
-* **SSID check is advisory** (macOS may report `None`)
-* **Credentials are sent only if portal is confirmed**
-* **Exponential backoff** prevents spamming
-* **One-shot execution** works cleanly with `launchd`
-
----
-
-## 🔧 Requirements
-
-* macOS (Monterey / Ventura / Sonoma tested)
-* Python 3.9+
-* Network using pfSense / Netgate captive portal
-
----
-
-## 🚀 Installation Guide
-
-### 1️⃣ Clone the repository
+Run the automated setup script:
 
 ```bash
-git clone https://github.com/YOUR_USERNAME/wifi-autologin.git
-cd wifi-autologin
+chmod +x setup.sh
+./setup.sh
 ```
+
+This will:
+1. Initialize a Python virtual environment (`venv/`).
+2. Install `requests`.
+3. Create `config.ini` from `config.ini.example` (with `chmod 600` permissions).
+4. Compile the native Swift Menu Bar app (`AutoLoginMenuBar.app`).
+5. Generate the configured `com.pfsense.autologin.plist` LaunchAgent for your user.
 
 ---
 
-### 2️⃣ Create a Python virtual environment (recommended)
+## ⚙️ Configuration (`config.ini`)
 
-```bash
-/usr/bin/python3 -m venv venv
-source venv/bin/activate
-pip install requests
-deactivate
-```
-
-Why:
-
-* Works cleanly with macOS `launchd`
-* No global installs
-* No Nix / Homebrew issues
-
----
-
-### 3️⃣ Configure credentials (IMPORTANT)
-
-Copy the example file:
-
-```bash
-cp config.ini.example config.ini
-```
-
-Edit `config.ini`:
+Edit `config.ini` with your credentials and portal URL:
 
 ```ini
 [credentials]
-username = YOUR_USERNAME
-password = YOUR_PASSWORD
+username = YOUR_PORTAL_USERNAME
+password = YOUR_PORTAL_PASSWORD
 
 [settings]
+# Captive portal login URL
 portal_url = http://172.20.28.1:8002/index.php?zone=hostelzone
+
+# Connectivity check endpoint (returns HTTP 204 when internet is UP)
 connectivity_check_url = http://clients3.google.com/generate_204
+
+# Target Wi-Fi SSID (leave empty to allow any network)
+ssid = MBH2_WiFi
+
+# Delay in seconds between connection retries
 retry_delay = 5
-ssid = YOUR_WIFI_SSID
-```
 
-⚠️ **Never commit `config.ini` to GitHub.**
+# Standby cooldown in seconds when another device is detected (default 900s = 15 min)
+conflict_cooldown = 900
+```
 
 ---
 
-### 4️⃣ Test manually
+## 🖥️ Running the Menu Bar App
+
+Simply launch the built application:
 
 ```bash
+open menubar/AutoLoginMenuBar.app
+```
+
+You will see the Wi-Fi icon appear in your macOS top menu bar. Click it to view the live connection status, toggle auto-login on/off, or release/force sessions!
+
+*Tip: To have the Menu Bar app launch automatically on Mac login, go to **System Settings > General > Login Items** and add `AutoLoginMenuBar.app` to "Open at Login".*
+
+---
+
+## ⏰ Enabling Background Automation (`launchd`)
+
+To have macOS automatically check and reconnect in the background:
+
+```bash
+# 1. Copy the plist to your LaunchAgents directory
+cp com.pfsense.autologin.plist ~/Library/LaunchAgents/
+
+# 2. Load the service using modern launchctl syntax
+launchctl bootout gui/$(id -u)/com.pfsense.autologin 2>/dev/null || true
+launchctl bootstrap gui/$(id -u) ~/Library/LaunchAgents/com.pfsense.autologin.plist
+```
+
+To stop or unload:
+```bash
+launchctl bootout gui/$(id -u)/com.pfsense.autologin
+```
+
+---
+
+## 🧪 Testing & Verification
+
+Run the comprehensive unit test suite:
+
+```bash
+venv/bin/python -m unittest tests/test_autologin.py
+```
+
+Check test coverage:
+```bash
+venv/bin/coverage run -m unittest tests/test_autologin.py
+venv/bin/coverage report -m
+```
+
+---
+
+## 🛠️ CLI Commands & Manual Usage
+
+```bash
+# Evaluate once and exit
 venv/bin/python portal_autologin.py --once
+
+# Force login (bypassing any active phone standby)
+venv/bin/python portal_autologin.py --force --once
+
+# Release captive session (logout) so phone can connect
+venv/bin/python portal_autologin.py --logout
+
+# Toggle auto-login on or off from the terminal
+venv/bin/python portal_autologin.py --toggle-on
+venv/bin/python portal_autologin.py --toggle-off
+
+# Print current state JSON
+venv/bin/python portal_autologin.py --status-json
+
+# Run as standalone continuous daemon (without launchd)
+venv/bin/python portal_autologin.py --daemon
 ```
-
-Expected:
-
-* If internet is already working → exits silently
-* If captive portal is active → logs in and exits
-
----
-
-## 🖥️ macOS Auto-Run Setup (launchd)
-
-### 1️⃣ Create LaunchAgent
-
-```bash
-mkdir -p ~/Library/LaunchAgents
-nano ~/Library/LaunchAgents/com.pfsense.autologin.plist
-```
-
-Paste the following:
-
-```xml
-<?xml version="1.0" encoding="UTF-8"?>
-<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN"
-  "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
-<plist version="1.0">
-<dict>
-
-  <key>Label</key>
-  <string>com.pfsense.autologin</string>
-
-  <key>ProgramArguments</key>
-  <array>
-    <string>/Users/YOUR_USERNAME/path/to/wifi-autologin/venv/bin/python</string>
-    <string>/Users/YOUR_USERNAME/path/to/wifi-autologin/portal_autologin.py</string>
-    <string>--once</string>
-  </array>
-
-  <key>WorkingDirectory</key>
-  <string>/Users/YOUR_USERNAME/path/to/wifi-autologin</string>
-
-  <key>RunAtLoad</key>
-  <true/>
-
-  <key>KeepAlive</key>
-  <dict>
-    <key>NetworkState</key>
-    <true/>
-  </dict>
-
-  <!-- Reliable fallback -->
-  <key>StartInterval</key>
-  <integer>60</integer>
-
-  <key>ThrottleInterval</key>
-  <integer>10</integer>
-
-  <key>StandardOutPath</key>
-  <string>/tmp/pfsense-autologin.out</string>
-  <key>StandardErrorPath</key>
-  <string>/tmp/pfsense-autologin.out</string>
-
-</dict>
-</plist>
-```
-
----
-
-### 2️⃣ Load the agent
-
-```bash
-launchctl unload ~/Library/LaunchAgents/com.pfsense.autologin.plist 2>/dev/null
-launchctl load ~/Library/LaunchAgents/com.pfsense.autologin.plist
-```
-
----
-
-### 3️⃣ Verify logs
-
-```bash
-tail -f /tmp/pfsense-autologin.out
-```
-
----
-
-## 🔐 Security Considerations
-
-* Credentials are sent **only** to the configured portal URL
-* No wildcard endpoints
-* No DNS guessing
-* No browser automation
-* No background credential leakage
-* Script exits immediately if internet is already available
-
----
-
-## ⚠️ Limitations
-
-This will **not** work if the portal requires:
-
-* JavaScript challenges
-* CSRF tokens
-* OTP / MFA
-* TLS client certificates
-
----
-
-## 🧪 Troubleshooting
-
-Manual run:
-
-```bash
-venv/bin/python portal_autologin.py --once
-```
-
-Logs:
-
-```bash
-tail -f /tmp/pfsense-autologin.out
-```
-
----
-
-## 🛡️ GitHub Safety Checklist
-
-* `config.ini` is ignored via `.gitignore`
-* Only `config.ini.example` is committed
-* `venv/` is ignored
-* No credentials ever committed
 
 ---
 
 ## 📜 License
- The MIT License (MIT)
-
-Copyright © 2026 <copyright holders>
-
-Permission is hereby granted, free of charge, to any person obtaining a copy of this software and associated documentation files (the “Software”), to deal in the Software without restriction, including without limitation the rights to use, copy, modify, merge, publish, distribute, sublicense, and/or sell copies of the Software, and to permit persons to whom the Software is furnished to do so, subject to the following conditions:
-
-The above copyright notice and this permission notice shall be included in all copies or substantial portions of the Software.
-
-THE SOFTWARE IS PROVIDED “AS IS”, WITHOUT WARRANTY OF ANY KIND, EXPRESS OR IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY, FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM, OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE.
-
-
----
+MIT License.

@@ -1,0 +1,32 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN"
+  "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+  <key>Label</key>
+  <string>com.pfsense.autologin</string>
+
+  <key>ProgramArguments</key>
+  <array>
+    <string>{{PYTHON_PATH}}</string>
+    <string>{{SCRIPT_PATH}}</string>
+    <string>--once</string>
+  </array>
+
+  <key>WorkingDirectory</key>
+  <string>{{WORKING_DIR}}</string>
+
+  <!-- Run once upon login/system boot -->
+  <key>RunAtLoad</key>
+  <true/>
+
+  <!-- Periodic health check (evaluated every 60 seconds) -->
+  <key>StartInterval</key>
+  <integer>60</integer>
+
+  <key>StandardOutPath</key>
+  <string>/tmp/pfsense-autologin.out</string>
+  <key>StandardErrorPath</key>
+  <string>/tmp/pfsense-autologin.out</string>
+</dict>
+</plist>

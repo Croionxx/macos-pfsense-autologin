@@ -1,0 +1,20 @@
+[credentials]
+username = YOUR_PORTAL_USERNAME
+password = YOUR_PORTAL_PASSWORD
+
+[settings]
+# Captive portal login URL (e.g. pfSense hostelzone/guestzone)
+portal_url = http://172.20.28.1:8002/index.php?zone=hostelzone
+
+# Connectivity verification URL (returns HTTP 204 when internet is UP)
+connectivity_check_url = http://clients3.google.com/generate_204
+
+# Target Wi-Fi SSID (empty to allow any network)
+ssid = MBH2_WiFi
+
+# Delay in seconds between connection evaluation retries
+retry_delay = 5
+
+# Standby cooldown in seconds when a concurrent session conflict (e.g. phone active) is detected.
+# Default is 900 seconds (15 minutes) to avoid ping-pong disconnection loops between phone and laptop.
+conflict_cooldown = 900

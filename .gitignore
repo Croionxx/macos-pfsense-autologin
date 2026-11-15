@@ -1,0 +1,32 @@
+# Credentials & local config
+config.ini
+
+# Virtual Environment & Python cache
+venv/
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+.pytest_cache/
+.coverage
+htmlcov/
+
+# Logs & temporary runtime files
+*.log
+autologin.log
+*.lock
+*.PROOF
+state.json
+state.json.tmp.*
+
+# macOS system files
+.DS_Store
+.AppleDouble
+.LSOverride
+
+# Generated service definition
+com.pfsense.autologin.plist
+
+# Build artifacts
+menubar/AutoLoginMenuBar
+menubar/AutoLoginMenuBar.app/
