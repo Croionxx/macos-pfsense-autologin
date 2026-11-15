@@ -1,12 +1,7 @@
 #!/usr/bin/env python3
 """
-pfSense Captive Portal Auto-Login with Session Arbitration and macOS Menu Bar Toggle
-Supports:
-- Mutual exclusion (flock) to prevent overlapping runs
-- Dynamic HTML form and CSRF token extraction
-- Anti-flapping session arbitration (standby on concurrent session limit / phone conflict)
-- Session release (logout) to free slots for other devices
-- Atomic state file for macOS Menu Bar (top bar) integration
+pfSense Captive Portal Auto-Login with Authoritative State Machine,
+Anti-Flapping Session Arbitration, and macOS Menu Bar Toggle Controller.
 """
 
 import os
@@ -14,6 +9,7 @@ import sys
 import time
 import fcntl
 import json
+import signal
 import logging
 import argparse
 import configparser
@@ -39,20 +35,24 @@ DEFAULT_LOCK_FILE = "/tmp/pfsense-autologin.lock"
 # Config directory for persistent state
 STATE_DIR = os.path.expanduser("~/.config/pfsense-autologin")
 DEFAULT_STATE_FILE = os.path.join(STATE_DIR, "state.json")
+DEFAULT_PID_FILE = os.path.join(STATE_DIR, "worker.pid")
 
 
 # --------------------------------------------------
-# Enums and Constants
+# States and Outcomes
 # --------------------------------------------------
 class Status:
     INITIALIZING = "INITIALIZING"
     CONNECTED = "CONNECTED"
     CAPTIVE = "CAPTIVE"
     AUTHENTICATING = "AUTHENTICATING"
-    CONFLICT_STANDBY = "CONFLICT_STANDBY"
+    STANDBY = "STANDBY"
+    CONFLICT_STANDBY = "CONFLICT_STANDBY"  # Backward-compatible alias
     AUTH_FAILED = "AUTH_FAILED"
-    QUOTA_EXCEEDED = "QUOTA_EXCEEDED"
-    DISCONNECTED = "DISCONNECTED"
+    QUOTA_EXHAUSTED = "QUOTA_EXHAUSTED"
+    QUOTA_EXCEEDED = "QUOTA_EXCEEDED"      # Backward-compatible alias
+    DEGRADED = "DEGRADED"
+    DISCONNECTED = "DISCONNECTED"          # Backward-compatible alias
     DISABLED = "DISABLED"
     UNKNOWN_NETWORK = "UNKNOWN_NETWORK"
 
@@ -61,6 +61,8 @@ class LoginOutcome(Enum):
     SUCCESS_OR_REDIRECT = "SUCCESS_OR_REDIRECT"
     SESSION_CONFLICT = "SESSION_CONFLICT"
     AUTH_FAILED = "AUTH_FAILED"
+    CSRF_OR_EXPIRED = "CSRF_OR_EXPIRED"
+    QUOTA_EXHAUSTED = "QUOTA_EXHAUSTED"
     QUOTA_EXCEEDED = "QUOTA_EXCEEDED"
     CAPTIVE_UNRESOLVED = "CAPTIVE_UNRESOLVED"
     ERROR = "ERROR"
@@ -87,7 +89,7 @@ def setup_logging(verbose=False):
 class PortalFormParser(HTMLParser):
     """
     Parses captive portal HTML to discover the actual form action URL
-    and all hidden input fields (such as __csrf_magic, zone, tokens).
+    and all hidden input fields (such as __csrf_magic, zone, redirurl).
     """
     def __init__(self, base_url):
         super().__init__()
@@ -118,13 +120,14 @@ class PortalFormParser(HTMLParser):
 
 
 # --------------------------------------------------
-# Response Classification (Anti-Flapping & Conflict Detection)
+# Response Classification
 # --------------------------------------------------
 def classify_portal_response(status_code, body_text):
     """
     Analyzes captive portal response to distinguish between:
-    - Session limits / phone conflicts
-    - Bad credentials
+    - Session conflicts / phone active
+    - Bad credentials (password error)
+    - CSRF token expiration
     - Quota exhaustion
     - Redirect or success
     """
@@ -133,7 +136,7 @@ def classify_portal_response(status_code, body_text):
 
     text = (body_text or "").lower()
 
-    # Concurrent session limit keywords (common in pfSense / FreeRADIUS)
+    # 1. Concurrent session limit keywords (phone conflict)
     conflict_keywords = [
         "maximum session limit",
         "already logged in",
@@ -145,9 +148,9 @@ def classify_portal_response(status_code, body_text):
     ]
     for kw in conflict_keywords:
         if kw in text:
-            return LoginOutcome.SESSION_CONFLICT, f"Concurrent session conflict detected ({kw})"
+            return LoginOutcome.SESSION_CONFLICT, f"Concurrent session conflict ({kw})"
 
-    # Bad credentials
+    # 2. Bad credentials
     auth_fail_keywords = [
         "invalid username or password",
         "invalid credentials",
@@ -158,7 +161,7 @@ def classify_portal_response(status_code, body_text):
         if kw in text:
             return LoginOutcome.AUTH_FAILED, f"Authentication credentials rejected ({kw})"
 
-    # Quota / Traffic limits
+    # 3. Quota / Traffic limits
     quota_keywords = [
         "quota has been exceeded",
         "data transfer quota",
@@ -167,12 +170,68 @@ def classify_portal_response(status_code, body_text):
     ]
     for kw in quota_keywords:
         if kw in text:
-            return LoginOutcome.QUOTA_EXCEEDED, f"Network quota reached ({kw})"
+            return LoginOutcome.QUOTA_EXHAUSTED, f"Network quota reached ({kw})"
+
+    # 4. CSRF / Token error
+    if "csrf" in text or status_code == 403:
+        return LoginOutcome.CSRF_OR_EXPIRED, "CSRF token mismatch or expired challenge"
 
     if status_code == 200:
         return LoginOutcome.CAPTIVE_UNRESOLVED, "Portal returned 200 OK without explicit confirmation"
 
     return LoginOutcome.ERROR, f"Portal returned unexpected status HTTP {status_code}"
+
+
+# --------------------------------------------------
+# Process Lifetime & In-Flight Cancellation
+# --------------------------------------------------
+class PIDManager:
+    """
+    Tracks active worker PID to support immediate cancellation
+    of in-flight HTTP requests and sleeps when toggled OFF.
+    """
+    def __init__(self, pid_file=None):
+        self.pid_file = pid_file or DEFAULT_PID_FILE
+
+    def record_pid(self):
+        directory = os.path.dirname(self.pid_file)
+        if directory and not os.path.exists(directory):
+            try:
+                os.makedirs(directory, exist_ok=True)
+            except OSError:
+                pass
+        try:
+            with open(self.pid_file, "w") as f:
+                f.write(f"{os.getpid()}\n")
+        except OSError:
+            pass
+
+    def clear_pid(self):
+        try:
+            if os.path.exists(self.pid_file):
+                os.remove(self.pid_file)
+        except OSError:
+            pass
+
+    def cancel_active_worker(self):
+        """Sends SIGTERM to cancel any running in-flight worker."""
+        if not os.path.exists(self.pid_file):
+            return False
+        try:
+            with open(self.pid_file, "r") as f:
+                content = f.read().strip()
+            if not content.isdigit():
+                return False
+            pid = int(content)
+            if pid != os.getpid():
+                # Check if process is alive
+                os.kill(pid, 0)
+                logging.info(f"Terminating active in-flight worker (PID {pid})")
+                os.kill(pid, signal.SIGTERM)
+                return True
+        except (OSError, ValueError):
+            pass
+        return False
 
 
 # --------------------------------------------------
@@ -183,8 +242,9 @@ class StateManager:
     Manages persistent state in ~/.config/pfsense-autologin/state.json.
     Enables macOS Menu Bar toggle and records live status, standby, and SSID.
     """
-    def __init__(self, state_path=None):
+    def __init__(self, state_path=None, pid_manager=None):
         self.state_path = state_path or DEFAULT_STATE_FILE
+        self.pid_manager = pid_manager or PIDManager()
         self._ensure_dir()
 
     def _ensure_dir(self):
@@ -204,7 +264,8 @@ class StateManager:
             "standby_until": 0,
             "standby_reason": "",
             "current_ssid": None,
-            "portal_url": ""
+            "portal_url": "",
+            "auth_failure_count": 0
         }
         if not os.path.exists(self.state_path):
             return default_state
@@ -238,6 +299,10 @@ class StateManager:
         return bool(self.load().get("enabled", True))
 
     def set_enabled(self, enabled):
+        if not enabled:
+            # Active in-flight request cancellation guarantee
+            self.pid_manager.cancel_active_worker()
+
         self.save({
             "enabled": bool(enabled),
             "status": Status.INITIALIZING if enabled else Status.DISABLED,
@@ -271,6 +336,107 @@ class StateManager:
             "status_message": "Standby cleared"
         })
 
+    def record_auth_failure(self):
+        count = self.load().get("auth_failure_count", 0) + 1
+        self.save({"auth_failure_count": count})
+        return count
+
+    def reset_auth_failures(self):
+        self.save({"auth_failure_count": 0})
+
+
+# --------------------------------------------------
+# Authoritative State Machine Controller
+# --------------------------------------------------
+class StateMachine:
+    """
+    Authoritative state controller enforcing explicit valid transitions
+    and preventing rogue state mutations.
+    """
+    VALID_TRANSITIONS = {
+        Status.INITIALIZING: {
+            Status.CONNECTED, Status.CAPTIVE, Status.AUTHENTICATING,
+            Status.DEGRADED, Status.DISCONNECTED, Status.DISABLED,
+            Status.INITIALIZING, Status.AUTH_FAILED, Status.UNKNOWN_NETWORK
+        },
+        Status.CONNECTED: {
+            Status.CAPTIVE, Status.DEGRADED, Status.DISCONNECTED,
+            Status.DISABLED, Status.CONNECTED
+        },
+        Status.CAPTIVE: {
+            Status.AUTHENTICATING, Status.DEGRADED, Status.DISCONNECTED,
+            Status.DISABLED, Status.CAPTIVE, Status.CONFLICT_STANDBY,
+            Status.STANDBY
+        },
+        Status.AUTHENTICATING: {
+            Status.CONNECTED, Status.STANDBY, Status.CONFLICT_STANDBY,
+            Status.AUTH_FAILED, Status.QUOTA_EXHAUSTED, Status.QUOTA_EXCEEDED,
+            Status.DEGRADED, Status.DISCONNECTED, Status.DISABLED, Status.CAPTIVE
+        },
+        Status.STANDBY: {
+            Status.AUTHENTICATING, Status.CONNECTED, Status.DISABLED,
+            Status.STANDBY, Status.INITIALIZING, Status.CONFLICT_STANDBY,
+            Status.CAPTIVE, Status.DEGRADED
+        },
+        Status.CONFLICT_STANDBY: {
+            Status.AUTHENTICATING, Status.CONNECTED, Status.DISABLED,
+            Status.CONFLICT_STANDBY, Status.INITIALIZING, Status.STANDBY,
+            Status.CAPTIVE, Status.DEGRADED
+        },
+        Status.AUTH_FAILED: {
+            Status.AUTHENTICATING, Status.DISABLED, Status.INITIALIZING,
+            Status.AUTH_FAILED, Status.CAPTIVE
+        },
+        Status.QUOTA_EXHAUSTED: {
+            Status.AUTHENTICATING, Status.DISABLED, Status.INITIALIZING,
+            Status.QUOTA_EXHAUSTED, Status.CAPTIVE
+        },
+        Status.QUOTA_EXCEEDED: {
+            Status.AUTHENTICATING, Status.DISABLED, Status.INITIALIZING,
+            Status.QUOTA_EXCEEDED, Status.CAPTIVE
+        },
+        Status.DEGRADED: {
+            Status.CONNECTED, Status.CAPTIVE, Status.DISABLED,
+            Status.DEGRADED, Status.DISCONNECTED, Status.AUTHENTICATING
+        },
+        Status.DISCONNECTED: {
+            Status.CONNECTED, Status.CAPTIVE, Status.DISABLED,
+            Status.DEGRADED, Status.DISCONNECTED, Status.INITIALIZING,
+            Status.AUTHENTICATING
+        },
+        Status.DISABLED: {
+            Status.INITIALIZING, Status.CONNECTED, Status.CAPTIVE, Status.DISABLED
+        },
+        Status.UNKNOWN_NETWORK: {
+            Status.CONNECTED, Status.CAPTIVE, Status.DISABLED, Status.UNKNOWN_NETWORK
+        }
+    }
+
+    def __init__(self, state_mgr):
+        self.state_mgr = state_mgr
+
+    @property
+    def current_status(self):
+        return self.state_mgr.load().get("status", Status.INITIALIZING)
+
+    def transition_to(self, new_status, message=None, extra=None):
+        current = self.current_status
+        allowed = self.VALID_TRANSITIONS.get(current, set())
+        if new_status not in allowed and current != new_status:
+            logging.warning(
+                f"Invalid state transition rejected: '{current}' -> '{new_status}'. Allowed: {allowed}"
+            )
+            return False
+
+        payload = {"status": new_status}
+        if message is not None:
+            payload["status_message"] = message
+        if extra:
+            payload.update(extra)
+
+        self.state_mgr.save(payload)
+        return True
+
 
 # --------------------------------------------------
 # Single-Instance Lock
@@ -278,7 +444,7 @@ class StateManager:
 class SingleInstanceLock:
     """
     Prevents duplicate instances from running concurrently using fcntl.flock.
-    Avoids race conditions and credential spam.
+    Avoids race conditions, inode races, and credential spam.
     """
     def __init__(self, lock_path=None):
         self.lock_path = lock_path or DEFAULT_LOCK_FILE
@@ -377,6 +543,7 @@ class AutoLoginEngine:
     def __init__(self, config, state_mgr=None, lock_file=None):
         self.config = config
         self.state_mgr = state_mgr or StateManager()
+        self.sm = StateMachine(self.state_mgr)
         self.lock = SingleInstanceLock(lock_file)
         self.session = requests.Session()
 
@@ -390,16 +557,30 @@ class AutoLoginEngine:
         self.ssid_required = settings.get("ssid", "").strip()
         self.retry_delay = int(settings.get("retry_delay", "5"))
         self.conflict_cooldown = int(settings.get("conflict_cooldown", "900"))  # Default 15 min
+        self.max_auth_retries = int(settings.get("max_auth_retries", "3"))
 
     def attempt_login(self, force=False):
         """
         Extracts portal form, parses CSRF tokens, submits login,
         and analyzes response to prevent session thrashing.
         """
-        self.state_mgr.save({
-            "status": Status.AUTHENTICATING,
-            "status_message": "Connecting to captive portal..."
-        })
+        # Hard lockout guard: Protect against permanent account lockouts
+        failure_count = self.state_mgr.load().get("auth_failure_count", 0)
+        if failure_count >= self.max_auth_retries and not force:
+            logging.error(
+                f"Authentication blocked: {failure_count} consecutive credential failures. "
+                "Update config.ini or use --force to override."
+            )
+            self.sm.transition_to(
+                Status.AUTH_FAILED,
+                message=f"Locked out: {failure_count} bad login attempts"
+            )
+            return False
+
+        self.sm.transition_to(
+            Status.AUTHENTICATING,
+            message="Connecting to captive portal..."
+        )
         logging.info(f"Connecting to captive portal at {self.portal_url}")
 
         action_url = self.portal_url
@@ -433,7 +614,7 @@ class AutoLoginEngine:
             "Referer": self.portal_url
         }
 
-        # 3. Submit login request
+        # 3. Submit login request with allow_redirects=False to prevent early connection drops
         try:
             logging.info("Submitting authentication POST")
             login_resp = self.session.post(
@@ -445,16 +626,36 @@ class AutoLoginEngine:
                 allow_redirects=False
             )
         except requests.RequestException as e:
-            logging.error(f"Login POST request failed: {e}")
-            self.state_mgr.save({
-                "status": Status.DISCONNECTED,
-                "status_message": f"Connection error: {e}"
-            })
+            logging.error(f"Login POST request failed (network transport error): {e}")
+            self.sm.transition_to(
+                Status.DEGRADED,
+                message=f"Transport error: {e}"
+            )
             return False
 
         # 4. Classify outcome
         outcome, message = classify_portal_response(login_resp.status_code, login_resp.text)
         logging.info(f"Portal response evaluated: {outcome.value} ({message})")
+
+        # Handle CSRF token mismatch / expired challenge transparent retry
+        if outcome == LoginOutcome.CSRF_OR_EXPIRED:
+            logging.info("Detected expired challenge / CSRF token. Fetching fresh form and retrying once...")
+            try:
+                fresh_resp = self.session.get(self.portal_url, timeout=7, verify=False, allow_redirects=True)
+                parser = PortalFormParser(base_url=self.portal_url)
+                parser.feed(fresh_resp.text)
+                payload.update(parser.hidden_fields)
+                login_resp = self.session.post(
+                    parser.action_url,
+                    data=payload,
+                    headers=headers,
+                    timeout=10,
+                    verify=False,
+                    allow_redirects=False
+                )
+                outcome, message = classify_portal_response(login_resp.status_code, login_resp.text)
+            except requests.RequestException:
+                pass
 
         if outcome == LoginOutcome.SESSION_CONFLICT:
             logging.warning("=== CONCURRENT SESSION LIMIT REACHED ===")
@@ -465,18 +666,19 @@ class AutoLoginEngine:
 
         elif outcome == LoginOutcome.AUTH_FAILED:
             logging.error(f"Authentication failed: {message}")
-            self.state_mgr.save({
-                "status": Status.AUTH_FAILED,
-                "status_message": message
-            })
+            self.state_mgr.record_auth_failure()
+            self.sm.transition_to(
+                Status.AUTH_FAILED,
+                message=message
+            )
             return False
 
-        elif outcome == LoginOutcome.QUOTA_EXCEEDED:
+        elif outcome in (LoginOutcome.QUOTA_EXHAUSTED, LoginOutcome.QUOTA_EXCEEDED):
             logging.error(f"Quota exceeded: {message}")
-            self.state_mgr.save({
-                "status": Status.QUOTA_EXCEEDED,
-                "status_message": message
-            })
+            self.sm.transition_to(
+                Status.QUOTA_EXHAUSTED,
+                message=message
+            )
             return False
 
         # 5. Confirm internet access via 204 check
@@ -484,17 +686,18 @@ class AutoLoginEngine:
         if internet_up(self.check_url, timeout=5):
             logging.info("Login successful: Internet access confirmed.")
             self.state_mgr.clear_standby()
-            self.state_mgr.save({
-                "status": Status.CONNECTED,
-                "status_message": "Internet connected"
-            })
+            self.state_mgr.reset_auth_failures()
+            self.sm.transition_to(
+                Status.CONNECTED,
+                message="Internet connected"
+            )
             return True
         else:
             logging.warning("Portal accepted request but internet 204 check failed.")
-            self.state_mgr.save({
-                "status": Status.CAPTIVE,
-                "status_message": "Still captive after login"
-            })
+            self.sm.transition_to(
+                Status.CAPTIVE,
+                message="Still captive after login"
+            )
             return False
 
     def logout(self):
@@ -513,10 +716,10 @@ class AutoLoginEngine:
             logging.info(f"Logout request sent to {logout_url} (HTTP {r.status_code})")
             # Enter standby so background checks don't immediately re-authenticate
             self.state_mgr.enter_standby(self.conflict_cooldown, reason="Session released for phone")
-            self.state_mgr.save({
-                "status": Status.DISCONNECTED,
-                "status_message": "Session released for phone (standby active)"
-            })
+            self.sm.transition_to(
+                Status.DEGRADED,
+                message="Session released for phone (standby active)"
+            )
             return True
         except requests.RequestException as e:
             logging.error(f"Failed to send logout request: {e}")
@@ -540,10 +743,10 @@ class AutoLoginEngine:
         # 1. Check Menu Bar toggle state
         if not self.state_mgr.is_enabled():
             logging.info("Auto-login is disabled via Menu Bar toggle. Exiting.")
-            self.state_mgr.save({
-                "status": Status.DISABLED,
-                "status_message": "Disabled via Menu Bar"
-            })
+            self.sm.transition_to(
+                Status.DISABLED,
+                message="Disabled via Menu Bar"
+            )
             return False
 
         # 2. Check SSID guard
@@ -553,31 +756,33 @@ class AutoLoginEngine:
         if self.ssid_required and ssid:
             if ssid != self.ssid_required:
                 logging.info(f"Current SSID '{ssid}' does not match required '{self.ssid_required}'. Standing down.")
-                self.state_mgr.save({
-                    "status": Status.UNKNOWN_NETWORK,
-                    "status_message": f"Connected to {ssid} (target: {self.ssid_required})"
-                })
+                self.sm.transition_to(
+                    Status.UNKNOWN_NETWORK,
+                    message=f"Connected to {ssid} (target: {self.ssid_required})"
+                )
                 return False
 
         # 3. Check if internet is already UP
         if internet_up(self.check_url):
             logging.info("Internet is UP and fully accessible.")
-            self.state_mgr.save({
-                "status": Status.CONNECTED,
-                "status_message": f"Connected ({ssid or 'Wi-Fi'})"
-            })
+            self.state_mgr.reset_auth_failures()
+            self.sm.transition_to(
+                Status.CONNECTED,
+                message=f"Connected ({ssid or 'Wi-Fi'})"
+            )
             return True
 
         logging.warning("Internet is DOWN or captive.")
+        self.sm.transition_to(Status.CAPTIVE, message="Internet captive; evaluating portal")
 
         # 4. Check if currently in Standby Mode due to phone session conflict
         if self.state_mgr.is_in_standby() and not force:
             remaining = self.state_mgr.get_standby_remaining()
             logging.info(f"In Standby Mode (phone active). Skipping login attempt. Remaining: {remaining}s")
-            self.state_mgr.save({
-                "status": Status.CONFLICT_STANDBY,
-                "status_message": f"Standby: Phone Active ({remaining}s left)"
-            })
+            self.sm.transition_to(
+                Status.CONFLICT_STANDBY,
+                message=f"Standby: Phone Active ({remaining}s left)"
+            )
             return False
 
         if force:
@@ -587,10 +792,10 @@ class AutoLoginEngine:
         # 5. Check if portal is reachable
         if not portal_available(self.portal_url):
             logging.warning(f"Captive portal at {self.portal_url} is not reachable.")
-            self.state_mgr.save({
-                "status": Status.DISCONNECTED,
-                "status_message": "Portal unreachable"
-            })
+            self.sm.transition_to(
+                Status.DEGRADED,
+                message="Portal unreachable"
+            )
             return False
 
         # 6. Attempt authentication
@@ -617,13 +822,14 @@ def load_config(config_path=None):
 # CLI Entry Point
 # --------------------------------------------------
 def main():
-    parser = argparse.ArgumentParser(description="pfSense Captive Portal Auto-Login with Session Arbitration")
+    parser = argparse.ArgumentParser(description="pfSense Captive Portal Auto-Login with Authoritative State Machine")
     parser.add_argument("--once", action="store_true", help="Run a single evaluation step and exit")
-    parser.add_argument("--force", action="store_true", help="Force login, clearing any active conflict standby")
+    parser.add_argument("--force", action="store_true", help="Force login, clearing active phone standby")
     parser.add_argument("--logout", action="store_true", help="Release portal session so other devices can connect")
     parser.add_argument("--toggle-on", action="store_true", help="Enable auto-login via state manager")
-    parser.add_argument("--toggle-off", action="store_true", help="Disable auto-login via state manager")
+    parser.add_argument("--toggle-off", action="store_true", help="Disable auto-login & cancel in-flight worker")
     parser.add_argument("--status-json", action="store_true", help="Print current status JSON and exit")
+    parser.add_argument("--reset-auth-lockout", action="store_true", help="Reset consecutive bad password counters")
     parser.add_argument("--daemon", action="store_true", help="Run continuously in background daemon loop")
     parser.add_argument("--config", type=str, default=DEFAULT_CONFIG_FILE, help="Path to config.ini")
     parser.add_argument("--verbose", action="store_true", help="Enable verbose debug logging")
@@ -631,7 +837,8 @@ def main():
     args = parser.parse_args()
     setup_logging(verbose=args.verbose)
 
-    state_mgr = StateManager()
+    pid_mgr = PIDManager()
+    state_mgr = StateManager(pid_manager=pid_mgr)
 
     # Fast handlers for Menu Bar IPC
     if args.toggle_on:
@@ -644,6 +851,11 @@ def main():
         print("Auto-login disabled.")
         return
 
+    if args.reset_auth_lockout:
+        state_mgr.reset_auth_failures()
+        print("Authentication lockout counter reset.")
+        return
+
     if args.status_json:
         print(json.dumps(state_mgr.load(), indent=2))
         return
@@ -653,7 +865,7 @@ def main():
     except FileNotFoundError as e:
         logging.error(str(e))
         state_mgr.save({
-            "status": Status.AUTH_FAILED,
+            "status": Status.DEGRADED,
             "status_message": "config.ini missing"
         })
         sys.exit(1)
@@ -663,6 +875,23 @@ def main():
     if not lock.acquire():
         logging.info("Another autologin instance is already running. Exiting cleanly.")
         return
+
+    # Record active PID for in-flight cancellation
+    pid_mgr.record_pid()
+
+    # Graceful signal handler
+    def handle_signal(signum, frame):
+        logging.info(f"Signal {signum} received: cancelling worker.")
+        state_mgr.save({
+            "status": Status.DISABLED,
+            "status_message": "Stopped via signal"
+        })
+        lock.release()
+        pid_mgr.clear_pid()
+        sys.exit(0)
+
+    signal.signal(signal.SIGTERM, handle_signal)
+    signal.signal(signal.SIGINT, handle_signal)
 
     try:
         engine = AutoLoginEngine(config, state_mgr=state_mgr)
@@ -696,10 +925,11 @@ def main():
     except Exception as e:
         logging.critical(f"Fatal error: {e}", exc_info=True)
         state_mgr.save({
-            "status": Status.AUTH_FAILED,
+            "status": Status.DEGRADED,
             "status_message": f"Fatal error: {e}"
         })
     finally:
+        pid_mgr.clear_pid()
         lock.release()
 
 

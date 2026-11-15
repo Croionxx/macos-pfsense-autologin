@@ -1,0 +1,22 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="utf-8">
+    <title>pfSense - Captive Portal Authentication</title>
+</head>
+<body class="page-captiveportal">
+    <div class="container">
+        <div class="alert alert-danger" role="alert">
+            <h4>Authentication Error</h4>
+            <p>Invalid username or password specified. Please verify your hostel credentials.</p>
+        </div>
+        <form method="post" action="/index.php?zone=hostelzone">
+            <input name="__csrf_magic" type="hidden" value="sid:token_after_fail_456" />
+            <input name="zone" type="hidden" value="hostelzone" />
+            <input id="auth_user" name="auth_user" type="text" />
+            <input id="auth_pass" name="auth_pass" type="password" />
+            <button type="submit" name="accept" value="Login">Sign In</button>
+        </form>
+    </div>
+</body>
+</html>

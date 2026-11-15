@@ -1,0 +1,25 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="utf-8">
+    <title>pfSense - Captive Portal</title>
+</head>
+<body class="page-captiveportal">
+    <div class="container">
+        <form method="post" action="/index.php?zone=hostelzone">
+            <input name="__csrf_magic" type="hidden" value="sid:f89b1c3e4a5d6e7f8091" />
+            <input name="zone" type="hidden" value="hostelzone" />
+            <input name="redirurl" type="hidden" value="https://clients3.google.com/generate_204" />
+            <div class="form-group">
+                <label for="auth_user">Username</label>
+                <input id="auth_user" name="auth_user" type="text" class="form-control" />
+            </div>
+            <div class="form-group">
+                <label for="auth_pass">Password</label>
+                <input id="auth_pass" name="auth_pass" type="password" class="form-control" />
+            </div>
+            <button type="submit" name="accept" value="Login" class="btn btn-primary">Sign In</button>
+        </form>
+    </div>
+</body>
+</html>

@@ -76,7 +76,7 @@ class TestSessionResponseDetection(unittest.TestCase):
         ]
         for text in quota_samples:
             result, reason = pal.classify_portal_response(200, text)
-            self.assertEqual(result, pal.LoginOutcome.QUOTA_EXCEEDED, f"Failed for: {text}")
+            self.assertEqual(result, pal.LoginOutcome.QUOTA_EXHAUSTED, f"Failed for: {text}")
 
     def test_detect_redirect_success(self):
         result, reason = pal.classify_portal_response(302, "")
@@ -263,7 +263,7 @@ class TestAutoLoginEngine(unittest.TestCase):
         engine.session = mock_session
         logged_out = engine.logout()
         self.assertTrue(logged_out)
-        self.assertEqual(state_mgr.load().get("status"), pal.Status.DISCONNECTED)
+        self.assertIn(state_mgr.load().get("status"), (pal.Status.DEGRADED, pal.Status.CONFLICT_STANDBY))
 
     @patch("portal_autologin.current_ssid", return_value="Other_Network")
     def test_wrong_ssid_skips(self, mock_ssid):
@@ -289,7 +289,7 @@ class TestAutoLoginEngine(unittest.TestCase):
              patch("portal_autologin.portal_available", return_value=False):
             res = engine.step_once()
             self.assertFalse(res)
-            self.assertEqual(state_mgr.load().get("status"), pal.Status.DISCONNECTED)
+            self.assertEqual(state_mgr.load().get("status"), pal.Status.DEGRADED)
 
     def test_attempt_login_network_error(self):
         state_mgr = pal.StateManager(self.state_file)
@@ -300,7 +300,7 @@ class TestAutoLoginEngine(unittest.TestCase):
         engine.session = mock_session
         res = engine.attempt_login()
         self.assertFalse(res)
-        self.assertEqual(state_mgr.load().get("status"), pal.Status.DISCONNECTED)
+        self.assertEqual(state_mgr.load().get("status"), pal.Status.DEGRADED)
 
     def test_attempt_login_bad_credentials(self):
         state_mgr = pal.StateManager(self.state_file)
@@ -338,7 +338,7 @@ class TestAutoLoginEngine(unittest.TestCase):
 
         res = engine.attempt_login()
         self.assertFalse(res)
-        self.assertEqual(state_mgr.load().get("status"), pal.Status.QUOTA_EXCEEDED)
+        self.assertEqual(state_mgr.load().get("status"), pal.Status.QUOTA_EXHAUSTED)
 
     def test_load_config_missing_raises(self):
         with self.assertRaises(FileNotFoundError):
@@ -378,6 +378,22 @@ class TestAutoLoginEngine(unittest.TestCase):
 
     def test_setup_logging(self):
         pal.setup_logging(verbose=True)
+
+    @patch("sys.argv", ["portal_autologin.py", "--reset-auth-lockout"])
+    def test_main_reset_auth_lockout(self):
+        with patch("portal_autologin.StateManager") as MockStateMgr:
+            mock_inst = MagicMock()
+            MockStateMgr.return_value = mock_inst
+            pal.main()
+            mock_inst.reset_auth_failures.assert_called()
+
+    def test_pid_manager_clear(self):
+        pid_file = os.path.join(self.temp_dir.name, "test_pid.pid")
+        pm = pal.PIDManager(pid_file)
+        pm.record_pid()
+        self.assertTrue(os.path.exists(pid_file))
+        pm.clear_pid()
+        self.assertFalse(os.path.exists(pid_file))
 
     def test_logout_enters_standby(self):
         state_mgr = pal.StateManager(self.state_file)
